@@ -3,7 +3,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    image: aionui-server:local
+    image: wuhao1477/aionui-server:latest
     container_name: aionui
     restart: unless-stopped
     init: true
