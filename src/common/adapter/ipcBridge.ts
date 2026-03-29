@@ -21,6 +21,7 @@ import type {
   AutoUpdateStatus,
 } from '../update/updateTypes';
 import type { ProtocolDetectionRequest, ProtocolDetectionResponse } from '../utils/protocolDetector';
+import type { SpeechToTextRequest, SpeechToTextResult } from '../types/speech';
 
 export const shell = {
   openFile: bridge.buildProvider<void, string>('open-file'), // 使用系统默认程序打开文件
@@ -293,11 +294,22 @@ export const fs = {
   disableSkillsMarket: bridge.buildProvider<IBridgeResponse, void>('disable-skills-market'),
 };
 
+export const speechToText = {
+  transcribe: bridge.buildProvider<SpeechToTextResult, SpeechToTextRequest>('speech-to-text.transcribe'),
+};
+
 export const fileWatch = {
   startWatch: bridge.buildProvider<IBridgeResponse, { filePath: string }>('file-watch-start'), // 开始监听文件变化
   stopWatch: bridge.buildProvider<IBridgeResponse, { filePath: string }>('file-watch-stop'), // 停止监听文件变化
   stopAllWatches: bridge.buildProvider<IBridgeResponse, void>('file-watch-stop-all'), // 停止所有文件监听
   fileChanged: bridge.buildEmitter<{ filePath: string; eventType: string }>('file-changed'), // 文件变化事件
+};
+
+// 工作空间 Office 文件监听（检测新增的 .pptx/.docx/.xlsx）/ Workspace office file watcher (detects new .pptx/.docx/.xlsx)
+export const workspaceOfficeWatch = {
+  start: bridge.buildProvider<IBridgeResponse, { workspace: string }>('workspace-office-watch-start'),
+  stop: bridge.buildProvider<IBridgeResponse, { workspace: string }>('workspace-office-watch-stop'),
+  fileAdded: bridge.buildEmitter<{ filePath: string; workspace: string }>('workspace-office-file-added'),
 };
 
 // 文件流式更新（Agent 写入文件时实时推送内容）/ File streaming updates (real-time content push when agent writes)
@@ -424,6 +436,10 @@ export const acpConversation = {
   >('acp.get-available-agents'),
   checkEnv: bridge.buildProvider<{ env: Record<string, string> }, void>('acp.check.env'),
   refreshCustomAgents: bridge.buildProvider<IBridgeResponse, void>('acp.refresh-custom-agents'),
+  testCustomAgent: bridge.buildProvider<
+    IBridgeResponse<{ step: 'cli_check' | 'acp_initialize'; error?: string }>,
+    { command: string; acpArgs?: string[]; env?: Record<string, string> }
+  >('acp.test-custom-agent'),
   checkAgentHealth: bridge.buildProvider<
     IBridgeResponse<{ available: boolean; latency?: number; error?: string }>,
     { backend: AcpBackend }
@@ -621,6 +637,24 @@ export const pptPreview = {
   stop: bridge.buildProvider<void, { filePath: string }>('ppt-preview.stop'),
   status: bridge.buildEmitter<{ state: 'starting' | 'installing' | 'ready' | 'error'; message?: string }>(
     'ppt-preview.status'
+  ),
+};
+
+// Word preview via officecli watch
+export const wordPreview = {
+  start: bridge.buildProvider<{ url: string }, { filePath: string }>('word-preview.start'),
+  stop: bridge.buildProvider<void, { filePath: string }>('word-preview.stop'),
+  status: bridge.buildEmitter<{ state: 'starting' | 'installing' | 'ready' | 'error'; message?: string }>(
+    'word-preview.status'
+  ),
+};
+
+// Excel preview via officecli watch
+export const excelPreview = {
+  start: bridge.buildProvider<{ url: string }, { filePath: string }>('excel-preview.start'),
+  stop: bridge.buildProvider<void, { filePath: string }>('excel-preview.stop'),
+  status: bridge.buildEmitter<{ state: 'starting' | 'installing' | 'ready' | 'error'; message?: string }>(
+    'excel-preview.status'
   ),
 };
 
