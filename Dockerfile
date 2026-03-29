@@ -6,7 +6,8 @@ RUN npm install -g bun
 
 # Install all dependencies (including devDeps for build)
 COPY package.json bun.lock ./
-RUN bun install
+COPY patches ./patches
+RUN bun install --ignore-scripts
 
 # Copy source
 COPY . .
@@ -23,7 +24,8 @@ WORKDIR /app
 COPY --from=builder /app/dist-server ./dist-server
 COPY --from=builder /app/out/renderer ./out/renderer
 COPY package.json bun.lock ./
-RUN bun install --production
+COPY patches ./patches
+RUN bun install --production --ignore-scripts
 
 ENV PORT=3000
 ENV NODE_ENV=production
@@ -34,4 +36,4 @@ ENV DATA_DIR=/data
 VOLUME ["/data"]
 EXPOSE 3000
 
-CMD ["bun", "dist-server/server.mjs"]
+CMD ["bun", "/app/dist-server/server.mjs"]
