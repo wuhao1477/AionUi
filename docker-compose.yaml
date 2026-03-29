@@ -1,0 +1,20 @@
+services:
+  aionui:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: aionui-server:local
+    container_name: aionui
+    restart: unless-stopped
+    init: true
+    ports:
+      - '${AIONUI_PORT:-40317}:3000'
+    environment:
+      NODE_ENV: production
+      PORT: 3000
+      ALLOW_REMOTE: 'true'
+      DATA_DIR: /data
+    volumes:
+      - ./docker-data:/data
+      - ./workspace:/workspace
+    working_dir: /workspace
