@@ -34,7 +34,7 @@ const ACP_PERF_LOG = process.env.ACP_PERF === '1';
 import BaseAgentManager from './BaseAgentManager';
 import { IpcAgentEventEmitter } from './IpcAgentEventEmitter';
 import { hasCronCommands } from './CronCommandDetector';
-import { hasNativeSkillSupport } from '@process/utils/initAgent';
+import { hasNativeSkillSupport } from '@/common/types/acpTypes';
 import { prepareFirstMessageWithSkillsIndex } from '@process/task/agentUtils';
 import { extractTextFromMessage, processCronInMessage } from './MessageMiddleware';
 import { stripThinkTags } from './ThinkTagDetector';
@@ -283,6 +283,7 @@ class AcpAgentManager extends BaseAgentManager<AcpAgentManagerData, AcpPermissio
           acpSessionId: data.acpSessionId,
           acpSessionUpdatedAt: data.acpSessionUpdatedAt,
           currentModelId: this.persistedModelId ?? undefined,
+          sessionMode: this.currentMode,
         },
         onSessionIdUpdate: (sessionId: string) => {
           // Save ACP session ID to database for resume support
