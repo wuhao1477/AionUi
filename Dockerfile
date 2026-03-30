@@ -17,8 +17,11 @@ RUN bun run build:renderer:web
 RUN node scripts/build-server.mjs
 
 # ---- Runtime image ----
-FROM oven/bun:latest AS runtime
+FROM node:22-slim AS runtime
 WORKDIR /app
+
+# Install bun since our CMD uses it
+RUN npm install -g bun
 
 # Copy only build artifacts and production deps
 COPY --from=builder /app/dist-server ./dist-server
@@ -26,7 +29,7 @@ COPY --from=builder /app/out/renderer ./out/renderer
 COPY package.json bun.lock ./
 COPY patches ./patches
 RUN bun install --production --ignore-scripts
-RUN bun install -g codex
+RUN npm install -g codex
 
 ENV PORT=3000
 ENV NODE_ENV=production
