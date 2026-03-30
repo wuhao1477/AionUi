@@ -31,8 +31,8 @@ COPY --from=builder /app/dist-server ./dist-server
 COPY --from=builder /app/out/renderer ./out/renderer
 COPY package.json bun.lock ./
 COPY patches ./patches
-RUN bun install --production --ignore-scripts
-RUN npm install -g codex
+RUN bun install --production --ignore-scripts && rm -rf ~/.bun/install/cache
+RUN npm install -g codex && npm cache clean --force
 
 ENV PORT=3000
 ENV NODE_ENV=production

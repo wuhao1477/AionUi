@@ -16,5 +16,6 @@ services:
       DATA_DIR: /data
     volumes:
       - ./docker-data:/data
-      - ./workspace:/workspace
+      # 将宿主机的项目或代码目录映射进容器内供 Agent 使用
+      - ./workspace:/app/workspace
       - ./.codex:/root/.codex
