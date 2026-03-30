@@ -20,6 +20,9 @@ RUN node scripts/build-server.mjs
 FROM node:22-slim AS runtime
 WORKDIR /app
 
+# Install native dependencies (libssl is required by some pre-compiled ACP agents)
+RUN apt-get update && apt-get install -y openssl ca-certificates && rm -rf /var/lib/apt/lists/*
+
 # Install bun since our CMD uses it
 RUN npm install -g bun
 
