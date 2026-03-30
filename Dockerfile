@@ -26,6 +26,7 @@ COPY --from=builder /app/out/renderer ./out/renderer
 COPY package.json bun.lock ./
 COPY patches ./patches
 RUN bun install --production --ignore-scripts
+RUN bun install -g codex
 
 ENV PORT=3000
 ENV NODE_ENV=production

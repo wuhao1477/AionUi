@@ -17,3 +17,4 @@ services:
     volumes:
       - ./docker-data:/data
       - ./workspace:/workspace
+      - ./.codex:/root/.codex
