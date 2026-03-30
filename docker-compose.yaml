@@ -17,4 +17,3 @@ services:
     volumes:
       - ./docker-data:/data
       - ./workspace:/workspace
-    working_dir: /workspace
