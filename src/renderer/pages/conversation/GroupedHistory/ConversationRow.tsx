@@ -118,7 +118,8 @@ const ConversationRow: React.FC<ConversationRowProps> = (props) => {
       <div
         id={'c-' + conversation.id}
         className={classNames(
-          'chat-history__item px-12px py-8px rd-8px flex justify-start items-center group cursor-pointer relative overflow-hidden shrink-0 conversation-item [&.conversation-item+&.conversation-item]:mt-2px min-w-0 transition-colors',
+          'chat-history__item py-8px rd-8px flex items-center group cursor-pointer relative overflow-hidden shrink-0 conversation-item [&.conversation-item+&.conversation-item]:mt-2px min-w-0 transition-colors',
+          collapsed ? 'justify-center px-0' : 'justify-start px-12px',
           {
             'hover:bg-[rgba(var(--primary-6),0.14)]': !batchMode,
             '!bg-active': selected,
@@ -198,7 +199,7 @@ const ConversationRow: React.FC<ConversationRowProps> = (props) => {
                       return;
                     }
                     if (key === 'export') {
-                      onExport(conversation);
+                      onExport?.(conversation);
                       return;
                     }
                     if (key === 'delete') {
@@ -218,12 +219,14 @@ const ConversationRow: React.FC<ConversationRowProps> = (props) => {
                       <span>{t('conversation.history.rename')}</span>
                     </div>
                   </Menu.Item>
-                  <Menu.Item key='export'>
-                    <div className='flex items-center gap-8px'>
-                      <Export theme='outline' size='14' />
-                      <span>{t('conversation.history.export')}</span>
-                    </div>
-                  </Menu.Item>
+                  {onExport && (
+                    <Menu.Item key='export'>
+                      <div className='flex items-center gap-8px'>
+                        <Export theme='outline' size='14' />
+                        <span>{t('conversation.history.export')}</span>
+                      </div>
+                    </Menu.Item>
+                  )}
                   <Menu.Item key='delete'>
                     <div className='flex items-center gap-8px text-[rgb(var(--warning-6))]'>
                       <DeleteOne theme='outline' size='14' />

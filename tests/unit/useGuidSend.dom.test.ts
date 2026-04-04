@@ -72,6 +72,8 @@ function makeDeps(overrides: Partial<GuidSendDeps> = {}): GuidSendDeps {
     isPresetAgent: false,
     selectedMode: 'default',
     selectedAcpModel: null,
+    pendingConfigOptions: {},
+    cachedConfigOptions: [],
     currentModel: undefined,
     findAgentByKey: vi.fn(),
     getEffectiveAgentType: vi.fn(() => ({ agentType: 'remote', isAvailable: true })),
@@ -117,7 +119,9 @@ describe('useGuidSend', () => {
         expect.objectContaining({
           type: 'remote',
           name: 'test message',
-          extra: expect.objectContaining({ remoteAgentId: 'agent-1' }),
+          extra: expect.objectContaining({
+            remoteAgentId: undefined,
+          }),
         })
       );
     });
@@ -130,7 +134,7 @@ describe('useGuidSend', () => {
         await result.current.handleSend();
       });
 
-      const stored = sessionStorage.getItem('remote_initial_message_new-conv');
+      const stored = sessionStorage.getItem('acp_initial_message_new-conv');
       expect(stored).toBeTruthy();
       const parsed = JSON.parse(stored!);
       expect(parsed.input).toBe('test message');
@@ -192,7 +196,7 @@ describe('useGuidSend', () => {
         await result.current.handleSend();
       });
 
-      const stored = sessionStorage.getItem('remote_initial_message_new-conv');
+      const stored = sessionStorage.getItem('acp_initial_message_new-conv');
       const parsed = JSON.parse(stored!);
       expect(parsed.files).toEqual(['/tmp/a.ts']);
     });

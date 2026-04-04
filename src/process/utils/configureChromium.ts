@@ -9,18 +9,20 @@ import http from 'http';
 import * as fs from 'fs';
 import * as path from 'path';
 import os from 'os';
+import { getDevAppName } from '@/common/platform';
 
 // ============ Environment Separation ============
-// MUST be the very first code to run: set app name before any getPath() call.
-// In development, use 'AionUi-Dev' so userData is isolated from the production install.
+// Set app name before any getPath() call so userData is isolated from production.
+// Note: getPlatformServices() auto-registration also applies this as a safety net
+// in case Rollup loads initStorage's chunk before this module runs.
 // 开发模式下设置独立 app 名称，userData 目录将与正式版隔离，允许同时运行
-// 这必须在所有其他代码之前执行，因为 getPath('userData') 会锁定当前的 app 名称
 if (!app.isPackaged) {
-  app.setName('AionUi-Dev');
+  const devAppName = getDevAppName();
+  app.setName(devAppName);
   // In Electron 28+, setName alone no longer updates userData path on macOS.
-  // Explicitly override userData to the AionUi-Dev directory.
+  // Explicitly override userData to the dev directory.
   const appSupportDir = path.dirname(app.getPath('userData'));
-  app.setPath('userData', path.join(appSupportDir, 'AionUi-Dev'));
+  app.setPath('userData', path.join(appSupportDir, devAppName));
 }
 
 // Configure Chromium command-line flags for WebUI and CLI modes
@@ -32,12 +34,14 @@ const isResetPassword = process.argv.includes('--resetpass');
 // Only configure flags for WebUI and --resetpass modes
 // 仅为 WebUI 和重置密码模式配置参数
 if (isWebUI || isResetPassword) {
-  // For Linux without DISPLAY, use headless Ozone platform
-  // 对于无显示服务器的 Linux，使用 headless Ozone 平台后端
+  // In WebUI/reset-password mode on Linux, force headless Ozone backend.
+  // This mode should never depend on X11/Wayland availability.
+  // 在 Linux 的 WebUI/重置密码模式下，强制使用 headless Ozone 后端，
+  // 避免因 DISPLAY 变量存在但显示服务不可用导致平台初始化失败。
   // Note: Do NOT use --headless (browser automation mode that causes auto-exit).
   // Instead, use --ozone-platform=headless which provides a proper display backend
   // without requiring a display server, keeping the Electron process alive.
-  if (process.platform === 'linux' && !process.env.DISPLAY) {
+  if (process.platform === 'linux') {
     app.commandLine.appendSwitch('ozone-platform', 'headless');
     app.commandLine.appendSwitch('disable-gpu');
     app.commandLine.appendSwitch('disable-software-rasterizer');

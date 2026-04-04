@@ -1,5 +1,6 @@
 import { AcpAgent } from '@process/agent/acp';
 import { channelEventBus } from '@process/channels/agent/ChannelEventBus';
+import { teamEventBus } from '@process/team/teamEventBus';
 import { ipcBridge } from '@/common';
 import type { CronMessageMeta, TMessage } from '@/common/chat/chatLib';
 import { isCodexAutoApproveMode } from '@/common/types/codex/codexModes';
@@ -27,17 +28,19 @@ import {
   getCodexSandboxModeForSessionMode,
   type CodexSandboxMode,
   writeCodexSandboxMode,
-} from '@process/agent/codex/connection/codexConfig';
+} from '@process/task/codexConfig';
 /** Enable ACP performance diagnostics via ACP_PERF=1 */
 const ACP_PERF_LOG = process.env.ACP_PERF === '1';
 
 import BaseAgentManager from './BaseAgentManager';
 import { IpcAgentEventEmitter } from './IpcAgentEventEmitter';
 import { hasCronCommands } from './CronCommandDetector';
+import { skillSuggestWatcher } from '@process/services/cron/SkillSuggestWatcher';
+import { extractAndStripThinkTags } from './ThinkTagDetector';
+import type { AgentKillReason } from './IAgentManager';
 import { hasNativeSkillSupport } from '@/common/types/acpTypes';
 import { prepareFirstMessageWithSkillsIndex } from '@process/task/agentUtils';
 import { extractTextFromMessage, processCronInMessage } from './MessageMiddleware';
-import { stripThinkTags } from './ThinkTagDetector';
 
 interface AcpAgentManagerData {
   workspace?: string;
@@ -62,6 +65,8 @@ interface AcpAgentManagerData {
   /** Persisted model ID for resume support / 持久化的模型 ID，用于恢复 */
   currentModelId?: string;
   sandboxMode?: CodexSandboxMode;
+  /** Pending config option selections from Guid page (applied after session creation) */
+  pendingConfigOptions?: Record<string, string>;
 }
 
 type BufferedStreamTextMessage = {
@@ -83,6 +88,13 @@ class AcpAgentManager extends BaseAgentManager<AcpAgentManagerData, AcpPermissio
   // Track current message for cron detection (accumulated from streaming chunks)
   private currentMsgId: string | null = null;
   private currentMsgContent: string = '';
+  /** Current turn's thinking message msg_id for accumulating content */
+  private thinkingMsgId: string | null = null;
+  /** Timestamp when thinking started for duration calculation */
+  private thinkingStartTime: number | null = null;
+  /** Accumulated thinking content for persistence */
+  private thinkingContent: string = '';
+  private thinkingDbFlushTimer: ReturnType<typeof setTimeout> | null = null;
   private acpAvailableSlashCommands: SlashCommandItem[] = [];
   private acpAvailableSlashWaiters: Array<(commands: SlashCommandItem[]) => void> = [];
   private readonly streamDbFlushIntervalMs = 120;
@@ -284,6 +296,11 @@ class AcpAgentManager extends BaseAgentManager<AcpAgentManagerData, AcpPermissio
           acpSessionUpdatedAt: data.acpSessionUpdatedAt,
           currentModelId: this.persistedModelId ?? undefined,
           sessionMode: this.currentMode,
+          pendingConfigOptions: data.pendingConfigOptions,
+          // Forward team MCP stdio config so AcpAgent.loadBuiltinSessionMcpServers() can inject it
+          teamMcpStdioConfig: (data as unknown as Record<string, unknown>).teamMcpStdioConfig as
+            | { name: string; command: string; args: string[]; env: Array<{ name: string; value: string }> }
+            | undefined,
         },
         onSessionIdUpdate: (sessionId: string) => {
           // Save ACP session ID to database for resume support
@@ -373,13 +390,54 @@ class AcpAgentManager extends BaseAgentManager<AcpAgentManagerData, AcpPermissio
             });
           }
 
+          // Persist config options to DB so AcpConfigSelector can render from cache
+          if (message.type === 'acp_model_info') {
+            const configOptions = this.getConfigOptions();
+            if (configOptions.length > 0) {
+              void this.saveConfigOptions(configOptions);
+            }
+          }
+
           // Persist context usage to conversation extra for restore on page switch
           if (message.type === 'acp_context_usage') {
             const usageData = message.data as { used: number; size: number };
             this.saveContextUsage(usageData);
           }
 
-          if (message.type !== 'thought' && message.type !== 'acp_model_info' && message.type !== 'acp_context_usage') {
+          // Convert thought events to thinking messages in conversation flow
+          if (message.type === 'thought') {
+            const thoughtData = message.data as { subject?: string; description?: string };
+            const content = thoughtData?.description || thoughtData?.subject || '';
+            if (content) {
+              this.emitThinkingMessage(content, 'thinking');
+            }
+          } else if (this.thinkingMsgId) {
+            // Any non-thought message means thinking phase is over
+            this.emitThinkingMessage('', 'done');
+            this.thinkingMsgId = null;
+            this.thinkingStartTime = null;
+            this.thinkingContent = '';
+          }
+
+          // Strip inline <think> tags from content messages BEFORE transform/DB/emit
+          // so thinking appears before main content and DB stores clean text
+          // (e.g. MiniMax models embed think tags in content)
+          if (message.type === 'content' && typeof message.data === 'string') {
+            const { thinking, content: stripped } = extractAndStripThinkTags(message.data);
+            if (thinking) {
+              this.emitThinkingMessage(thinking, 'thinking');
+            }
+            if (stripped !== message.data) {
+              message = { ...message, data: stripped };
+            }
+          }
+
+          if (
+            message.type !== 'thought' &&
+            message.type !== 'thinking' &&
+            message.type !== 'acp_model_info' &&
+            message.type !== 'acp_context_usage'
+          ) {
             const transformStart = Date.now();
             const tMessage = transformMessage(message as IResponseMessage);
             const transformDuration = Date.now() - transformStart;
@@ -418,20 +476,20 @@ class AcpAgentManager extends BaseAgentManager<AcpAgentManagerData, AcpPermissio
             }
           }
 
-          // Filter think tags from streaming content before emitting to UI
-          // 在发送到 UI 之前过滤流式内容中的 think 标签
-          const filterStart = Date.now();
-          const filteredMessage = this.filterThinkTagsFromMessage(message as IResponseMessage);
-          const filterDuration = Date.now() - filterStart;
-
           const emitStart = Date.now();
-          ipcBridge.acpConversation.responseStream.emit(filteredMessage);
+          ipcBridge.acpConversation.responseStream.emit(message as IResponseMessage);
+          // Also emit to main-process-local bus so TeammateManager (same process)
+          // can receive events — ipcBridge.emit only delivers to renderer via webContents.send()
+          teamEventBus.emit('responseStream', {
+            ...(message as IResponseMessage),
+            conversation_id: this.conversation_id,
+          });
           const emitDuration = Date.now() - emitStart;
 
           // Also emit to Channel global event bus (Telegram/Lark streaming)
           // 同时发送到 Channel 全局事件总线（用于 Telegram/Lark 等外部平台）
           channelEventBus.emitAgentMessage(this.conversation_id, {
-            ...filteredMessage,
+            ...(message as IResponseMessage),
             conversation_id: this.conversation_id,
           });
 
@@ -439,7 +497,7 @@ class AcpAgentManager extends BaseAgentManager<AcpAgentManagerData, AcpPermissio
           if (totalDuration > 10) {
             if (ACP_PERF_LOG)
               console.log(
-                `[ACP-PERF] stream: onStreamEvent pipeline ${totalDuration}ms (filter=${filterDuration}ms, emit=${emitDuration}ms) type=${message.type}`
+                `[ACP-PERF] stream: onStreamEvent pipeline ${totalDuration}ms (emit=${emitDuration}ms) type=${message.type}`
               );
           }
         },
@@ -450,6 +508,29 @@ class AcpAgentManager extends BaseAgentManager<AcpAgentManagerData, AcpPermissio
           // 仅发送信号到前端，不更新消息列表
           if (v.type === 'acp_permission') {
             const { toolCall, options } = v.data as AcpPermissionRequest;
+
+            // Auto-approve ALL tools when in yolo/bypassPermissions mode.
+            // Fallback for cases where this.yoloMode wasn't set correctly
+            // (e.g., setMode IPC failed silently for spawned agents).
+            if (this.isYoloMode(this.currentMode) && options.length > 0) {
+              const autoOption = options[0];
+              setTimeout(() => {
+                void this.confirm(v.msg_id, toolCall.toolCallId || v.msg_id, autoOption);
+              }, 50);
+              return;
+            }
+
+            // Auto-approve team MCP tools — they are internal tools provided by AionUi,
+            // not external MCP servers, so they should never require user confirmation.
+            const toolTitle = toolCall.title || '';
+            if (toolTitle.includes('aionui-team') && options.length > 0) {
+              const autoOption = options[0];
+              setTimeout(() => {
+                void this.confirm(v.msg_id, toolCall.toolCallId || v.msg_id, autoOption);
+              }, 50);
+              return;
+            }
+
             this.addConfirmation({
               title: toolCall.title || 'messages.permissionRequest',
               action: 'messages.command',
@@ -473,9 +554,19 @@ class AcpAgentManager extends BaseAgentManager<AcpAgentManagerData, AcpPermissio
             return;
           }
 
-          // Clear busy guard when turn ends
+          // Clear busy guard and finalize thinking message when turn ends
           if (v.type === 'finish') {
             cronBusyGuard.setProcessing(this.conversation_id, false);
+            this.status = 'finished';
+            // Finalize thinking message with done status
+            if (this.thinkingMsgId) {
+              this.emitThinkingMessage('', 'done');
+              this.thinkingMsgId = null;
+              this.thinkingStartTime = null;
+              this.thinkingContent = '';
+            }
+            // Check for SKILL_SUGGEST.md updates (registered by cron executor)
+            skillSuggestWatcher.onFinish(this.conversation_id);
           }
 
           // Process cron commands when turn ends (finish signal)
@@ -515,6 +606,11 @@ class AcpAgentManager extends BaseAgentManager<AcpAgentManagerData, AcpPermissio
           }
 
           ipcBridge.acpConversation.responseStream.emit(v);
+          // Also emit to main-process-local bus (same reason as onStreamEvent above)
+          teamEventBus.emit('responseStream', {
+            ...(v as IResponseMessage),
+            conversation_id: this.conversation_id,
+          });
 
           // Forward signals (finish/error/etc.) to Channel global event bus
           channelEventBus.emitAgentMessage(this.conversation_id, {
@@ -580,7 +676,14 @@ class AcpAgentManager extends BaseAgentManager<AcpAgentManagerData, AcpPermissio
     return this.bootstrap;
   }
 
-  async sendMessage(data: { content: string; files?: string[]; msg_id?: string; cronMeta?: CronMessageMeta }): Promise<{
+  async sendMessage(data: {
+    content: string;
+    files?: string[];
+    msg_id?: string;
+    cronMeta?: CronMessageMeta;
+    hidden?: boolean;
+    silent?: boolean;
+  }): Promise<{
     success: boolean;
     msg?: string;
     message?: string;
@@ -588,6 +691,7 @@ class AcpAgentManager extends BaseAgentManager<AcpAgentManagerData, AcpPermissio
     // Allow stream events through once user actually sends a message,
     // so initAgent progress (agent_status) is visible during the wait.
     this.bootstrapping = false;
+    this._lastActivityAt = Date.now();
 
     const managerSendStart = Date.now();
     // Mark conversation as busy to prevent cron jobs from running
@@ -597,7 +701,7 @@ class AcpAgentManager extends BaseAgentManager<AcpAgentManagerData, AcpPermissio
     try {
       // Emit/persist user message immediately so UI can refresh without waiting
       // for ACP connection/auth/session initialization.
-      if (data.msg_id && data.content) {
+      if (data.msg_id && data.content && !data.silent) {
         const userMessage: TMessage = {
           id: data.msg_id,
           msg_id: data.msg_id,
@@ -609,6 +713,7 @@ class AcpAgentManager extends BaseAgentManager<AcpAgentManagerData, AcpPermissio
             ...(data.cronMeta && { cronMeta: data.cronMeta }),
           },
           createdAt: Date.now(),
+          ...(data.hidden && { hidden: true }),
         };
         addMessage(this.conversation_id, userMessage);
         // Ensure conversation list sorting updates immediately after user sends.
@@ -624,6 +729,7 @@ class AcpAgentManager extends BaseAgentManager<AcpAgentManagerData, AcpPermissio
           data: data.cronMeta
             ? { content: userMessage.content.content, cronMeta: data.cronMeta }
             : userMessage.content.content,
+          ...(data.hidden && { hidden: true }),
         };
         ipcBridge.acpConversation.responseStream.emit(userResponseMessage);
       }
@@ -781,33 +887,64 @@ class AcpAgentManager extends BaseAgentManager<AcpAgentManagerData, AcpPermissio
   }
 
   /**
-   * Filter think tags from message content during streaming
-   * This ensures users don't see internal reasoning tags in real-time
-   *
-   * @param message - The streaming message to filter
-   * @returns Message with think tags removed from content
+   * Emit a thinking message to the UI stream.
+   * Creates a new thinking msg_id on first call per turn, reuses it for subsequent calls.
    */
-  private filterThinkTagsFromMessage(message: IResponseMessage): IResponseMessage {
-    // Only filter content messages
-    if (message.type !== 'content' || typeof message.data !== 'string') {
-      return message;
+  private emitThinkingMessage(content: string, status: 'thinking' | 'done' = 'thinking'): void {
+    if (!this.thinkingMsgId) {
+      this.thinkingMsgId = uuid();
+      this.thinkingStartTime = Date.now();
+      this.thinkingContent = '';
     }
 
-    const content = message.data;
-    // Quick check to avoid unnecessary processing
-    // Match both opening and closing tags (including orphaned </think> from MiniMax-style models)
-    if (!/<\s*\/?\s*think(?:ing)?\s*>/i.test(content)) {
-      return message;
+    // Accumulate content during streaming
+    if (status === 'thinking') {
+      this.thinkingContent += content;
     }
 
-    // Strip think tags from content
-    const cleanedContent = stripThinkTags(content);
+    const duration = status === 'done' && this.thinkingStartTime ? Date.now() - this.thinkingStartTime : undefined;
 
-    // Return new message object with cleaned content
-    return {
-      ...message,
-      data: cleanedContent,
+    ipcBridge.acpConversation.responseStream.emit({
+      type: 'thinking',
+      conversation_id: this.conversation_id,
+      msg_id: this.thinkingMsgId,
+      data: {
+        content,
+        duration,
+        status,
+      },
+    });
+
+    // Persist: done flushes immediately, streaming chunks use buffered timer
+    if (status === 'done') {
+      this.flushThinkingToDb(duration, 'done');
+    } else if (!this.thinkingDbFlushTimer) {
+      this.thinkingDbFlushTimer = setTimeout(() => {
+        this.flushThinkingToDb(undefined, 'thinking');
+      }, this.streamDbFlushIntervalMs);
+    }
+  }
+
+  private flushThinkingToDb(duration: number | undefined, status: 'thinking' | 'done'): void {
+    if (this.thinkingDbFlushTimer) {
+      clearTimeout(this.thinkingDbFlushTimer);
+      this.thinkingDbFlushTimer = null;
+    }
+    if (!this.thinkingMsgId) return;
+    const tMessage: TMessage = {
+      id: this.thinkingMsgId,
+      msg_id: this.thinkingMsgId,
+      type: 'thinking',
+      position: 'left',
+      conversation_id: this.conversation_id,
+      content: {
+        content: this.thinkingContent,
+        duration,
+        status,
+      },
+      createdAt: this.thinkingStartTime || Date.now(),
     };
+    addOrUpdateMessage(this.conversation_id, tMessage, this.options.backend);
   }
 
   /**
@@ -921,7 +1058,11 @@ class AcpAgentManager extends BaseAgentManager<AcpAgentManagerData, AcpPermissio
       }
     }
     if (!this.agent) return [];
-    return await this.agent.setConfigOption(configId, value);
+    const updated = await this.agent.setConfigOption(configId, value);
+    if (updated.length > 0) {
+      void this.saveConfigOptions(updated);
+    }
+    return updated;
   }
 
   /**
@@ -1093,6 +1234,26 @@ class AcpAgentManager extends BaseAgentManager<AcpAgentManagerData, AcpPermissio
   }
 
   /**
+   * Save non-model/mode config options to database for resume support.
+   * Allows AcpConfigSelector to render immediately from cached data
+   * even when the ACP session has expired.
+   */
+  private async saveConfigOptions(configOptions: AcpSessionConfigOption[]): Promise<void> {
+    try {
+      const db = await getDatabase();
+      const result = db.getConversation(this.conversation_id);
+      if (result.success && result.data && result.data.type === 'acp') {
+        const conversation = result.data;
+        db.updateConversation(this.conversation_id, {
+          extra: { ...conversation.extra, cachedConfigOptions: configOptions },
+        } as Partial<typeof conversation>);
+      }
+    } catch (error) {
+      mainError('[AcpAgentManager]', 'Failed to save config options', error);
+    }
+  }
+
+  /**
    * Override kill() to ensure ACP CLI process is terminated.
    *
    * Problem: AcpAgentManager spawns CLI agents (claude, codex, etc.) as child
@@ -1107,7 +1268,7 @@ class AcpAgentManager extends BaseAgentManager<AcpAgentManagerData, AcpPermissio
    * An idempotent doKill() guard prevents double super.kill() when the hard
    * timeout and graceful path race against each other.
    */
-  kill() {
+  kill(reason?: AgentKillReason) {
     this.flushBufferedStreamTextMessages();
 
     let killed = false;

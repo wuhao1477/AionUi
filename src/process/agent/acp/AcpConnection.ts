@@ -21,7 +21,6 @@ import { ACP_METHODS, JSONRPC_VERSION } from '@/common/types/acpTypes';
 import type { ChildProcess } from 'child_process';
 import { execFile as execFileCb } from 'child_process';
 import { promisify } from 'util';
-import { buildAcpModelInfo, summarizeAcpModelInfo } from './modelInfo';
 import type { AcpSessionMcpServer } from './mcpSessionConfig';
 import { mainLog } from '@process/utils/mainLogger';
 import { promises as fs } from 'fs';
@@ -43,6 +42,56 @@ const execFile = promisify(execFileCb);
 
 // Re-export for unit tests that import from this module
 export { createGenericSpawnConfig } from './acpConnectors';
+
+/**
+ * Build a user-friendly error message for ACP startup failures.
+ * Detects known error patterns (CLI not found, config errors) and
+ * provides actionable guidance instead of raw stderr.
+ *
+ * Exported for unit testing.
+ */
+export function buildStartupErrorMessage(
+  backend: string,
+  code: number | null,
+  signal: NodeJS.Signals | null,
+  stderrCombined: string,
+  spawnErrorMessage: string | undefined,
+  resolvedBackend: string | null
+): string {
+  let errMsg: string;
+  if (stderrCombined) {
+    errMsg = `${backend} ACP process exited during startup (code: ${code}):\n${stderrCombined}`;
+  } else if (code === 0) {
+    // Exit code 0 with no stderr strongly suggests the CLI version does not support ACP mode
+    errMsg =
+      `${backend} ACP process exited during startup (code: 0). ` +
+      `This usually means the installed ${backend} CLI version does not support ACP mode. ` +
+      `Please upgrade to a newer version that supports ACP.`;
+  } else {
+    errMsg = `${backend} ACP process exited during startup (code: ${code}, signal: ${signal})`;
+  }
+
+  // Detect "command not found" patterns across platforms and provide a clear hint
+  if (
+    code !== 0 &&
+    /not recognized|not found|No such file|command not found|ENOENT/i.test(stderrCombined + (spawnErrorMessage ?? ''))
+  ) {
+    const cliHint = resolvedBackend ?? backend;
+    errMsg = `'${cliHint}' CLI not found. Please install it or update the CLI path in Settings.\n${stderrCombined}`;
+  }
+
+  // Detect CLI config loading errors and provide actionable guidance.
+  // e.g. Codex multi-agent config in config.toml that codex-acp cannot parse.
+  if (code !== 0 && /error loading config/i.test(stderrCombined)) {
+    const configPathMatch = stderrCombined.match(/error loading config:\s*([^\s:]+)/i);
+    const configHint = configPathMatch?.[1] ?? 'the CLI config file';
+    errMsg =
+      `${backend} CLI failed to start due to a config file error. ` +
+      `Please review or temporarily rename ${configHint} and try again.\n${stderrCombined}`;
+  }
+
+  return errMsg;
+}
 
 interface PendingRequest<T = unknown> {
   resolve: (value: T) => void;
@@ -173,7 +222,7 @@ export class AcpConnection {
       if (AcpConnection.NPX_BACKENDS.has(backend) && /notarget|no matching version/i.test(errMsg)) {
         console.warn(`[ACP] Detected stale npm cache for ${backend}, cleaning and retrying...`);
         try {
-          const cleanEnv = prepareCleanEnv();
+          const cleanEnv = await prepareCleanEnv();
           const npmPath = resolveNpxPath(cleanEnv)
             .replace(/npx$/, 'npm')
             .replace(/npx\.cmd$/, 'npm.cmd');
@@ -347,28 +396,14 @@ export class AcpConnection {
         // Combine head + tail, deduplicating any overlap
         const stderrCombined =
           stderrHead + (stderrTail && !stderrHead.endsWith(stderrTail) ? '\n…\n' + stderrTail : '');
-        let errMsg: string;
-        if (stderrCombined) {
-          errMsg = `${backend} ACP process exited during startup (code: ${code}):\n${stderrCombined}`;
-        } else if (code === 0) {
-          // Exit code 0 with no stderr strongly suggests the CLI version does not support ACP mode
-          errMsg =
-            `${backend} ACP process exited during startup (code: 0). ` +
-            `This usually means the installed ${backend} CLI version does not support ACP mode. ` +
-            `Please upgrade to a newer version that supports ACP.`;
-        } else {
-          errMsg = `${backend} ACP process exited during startup (code: ${code}, signal: ${signal})`;
-        }
-        // Detect "command not found" patterns across platforms and provide a clear hint
-        if (
-          code !== 0 &&
-          /not recognized|not found|No such file|command not found|ENOENT/i.test(
-            stderrCombined + (spawnError?.message ?? '')
-          )
-        ) {
-          const cliHint = this.backend ?? backend;
-          errMsg = `'${cliHint}' CLI not found. Please install it or update the CLI path in Settings.\n${stderrCombined}`;
-        }
+        const errMsg = buildStartupErrorMessage(
+          backend,
+          code,
+          signal,
+          stderrCombined,
+          spawnError?.message,
+          this.backend
+        );
         if (code !== 0 && !spawnError) {
           spawnError = new Error(errMsg);
         }
@@ -932,17 +967,6 @@ export class AcpConnection {
     const modelsSource = result.models || (result._meta as Record<string, unknown> | undefined)?.models;
     if (modelsSource && typeof modelsSource === 'object') {
       this.models = modelsSource as AcpSessionModels;
-    }
-    if (this.backend === 'codex') {
-      const unifiedModelInfo = buildAcpModelInfo(this.configOptions, this.models);
-      const modelOption = this.configOptions?.find((opt) => opt.category === 'model');
-      mainLog('[ACP codex]', 'session capabilities parsed', {
-        rawCurrentModelId: this.models?.currentModelId || null,
-        rawAvailableModelCount: this.models?.availableModels?.length || 0,
-        configOptionModelCount:
-          modelOption && modelOption.type === 'select' && modelOption.options ? modelOption.options.length : 0,
-        unified: summarizeAcpModelInfo(unifiedModelInfo),
-      });
     }
   }
 

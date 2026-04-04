@@ -96,7 +96,10 @@ export class WorkspaceSnapshotService {
   // --- Branch operations (git-repo mode only) ---
 
   async getBranches(workspacePath: string): Promise<string[]> {
-    this.ensureGitRepo(workspacePath);
+    const state = this.snapshots.get(workspacePath);
+    if (!state || state.mode !== 'git-repo') {
+      return [];
+    }
     const { stdout } = await execFileAsync('git', ['branch', '--format=%(refname:short)'], { cwd: workspacePath });
     return stdout
       .split('\n')
@@ -180,6 +183,24 @@ export class WorkspaceSnapshotService {
   async disposeAll(): Promise<void> {
     const workspaces = Array.from(this.snapshots.keys());
     await Promise.all(workspaces.map((ws) => this.dispose(ws)));
+  }
+
+  /**
+   * Remove leftover `aionui-snapshot-*` directories from previous sessions
+   * that were not cleaned up (e.g. due to a crash). Safe to call at startup
+   * as a fire-and-forget — errors are silently ignored.
+   */
+  static async cleanupStaleSnapshots(): Promise<void> {
+    const tmpdir = os.tmpdir();
+    let entries: string[];
+    try {
+      entries = await fs.readdir(tmpdir);
+    } catch {
+      return;
+    }
+
+    const stale = entries.filter((name) => name.startsWith('aionui-snapshot-'));
+    await Promise.allSettled(stale.map((name) => fs.rm(path.join(tmpdir, name), { recursive: true, force: true })));
   }
 
   // --- Private ---

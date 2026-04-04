@@ -43,9 +43,13 @@ const createInitStyle = (currentTheme = 'light', cssVars?: Record<string, string
   {
     margin-top:0px;
   }
-  h1,h2,h3,h4,h5,h6,p,pre{
+  h1,h2,h3,h4,h5,h6{
     margin-block-start:0px;
     margin-block-end:0px;
+  }
+  .markdown-shadow-body p {
+    margin-block-start: 10px;
+    margin-block-end: 10px;
   }
   a{
     color:${theme.Color.PrimaryColor};
@@ -66,8 +70,9 @@ const createInitStyle = (currentTheme = 'light', cssVars?: Record<string, string
     margin-top: 8px;
     margin-bottom: 8px;
   }
-  code{
-    font-size:14px;
+  code span{
+    font-size:13px;
+    line-height:20px;
   }
 
   .markdown-shadow-body>p:last-child{
@@ -79,6 +84,8 @@ const createInitStyle = (currentTheme = 'light', cssVars?: Record<string, string
   pre {
     max-width: 100%;
     overflow-x: auto;
+    margin-block-start: 8px;
+    margin-block-end: 8px;
   }
   img {
     max-width: 100%;

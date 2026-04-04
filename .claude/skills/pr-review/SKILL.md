@@ -95,6 +95,7 @@ gh pr view <PR_NUMBER> --json statusCheckRollup \
   <!-- automation-result -->
   CONCLUSION: CI_NOT_READY
   IS_CRITICAL_PATH: false
+  CRITICAL_PATH_FILES: (none)
   PR_NUMBER: <PR_NUMBER>
   <!-- /automation-result -->
   ```
@@ -119,6 +120,7 @@ gh pr view <PR_NUMBER> --json statusCheckRollup \
   <!-- automation-result -->
   CONCLUSION: CI_FAILED
   IS_CRITICAL_PATH: false
+  CRITICAL_PATH_FILES: (none)
   PR_NUMBER: <PR_NUMBER>
   <!-- /automation-result -->
   ```
@@ -154,37 +156,38 @@ gh pr comment <PR_NUMBER> --body "<!-- pr-review-bot -->
 
 ---
 
-### Step 3 — Check Working Tree
+### Step 3 — Create Worktree
+
+Create an isolated worktree for this PR review. The main repo stays on its current branch.
 
 ```bash
-git status --porcelain
+REPO_ROOT=$(git rev-parse --show-toplevel)
+PR_NUMBER=<PR_NUMBER>
+WORKTREE_DIR="/tmp/aionui-pr-${PR_NUMBER}"
+
+# Clean up any stale worktree from a previous crash
+git worktree remove "$WORKTREE_DIR" --force 2>/dev/null || true
+
+# Fetch PR head AND base branch so the three-dot diff is accurate
+git fetch origin pull/${PR_NUMBER}/head
+BASE_REF=$(gh pr view ${PR_NUMBER} --json baseRefName --jq '.baseRefName')
+git fetch origin "$BASE_REF"
+git worktree add "$WORKTREE_DIR" FETCH_HEAD --detach
+
+# Symlink node_modules so lint/tsc/test can run in the worktree
+ln -s "$REPO_ROOT/node_modules" "$WORKTREE_DIR/node_modules"
 ```
 
-If the output is non-empty, abort with:
+Save `REPO_ROOT` and `WORKTREE_DIR` for use in subsequent steps. All file reads, lint, and diff commands from this point forward run inside `WORKTREE_DIR`.
 
-> Working tree has uncommitted changes. Please commit or stash them before running pr-review.
-
-### Step 4 — Record Current Branch
+Save the checked-out HEAD info:
 
 ```bash
-git branch --show-current
+cd "$WORKTREE_DIR"
+git log --oneline -1
 ```
 
-Save this as `<original_branch>` for Step 10.
-
-### Step 5 — Checkout PR Branch
-
-```bash
-gh pr checkout <PR_NUMBER>
-```
-
-Save the checked-out branch name:
-
-```bash
-git branch --show-current
-```
-
-### Step 6 — Collect Context (Parallel)
+### Step 4 — Collect Context (Parallel)
 
 Run the following in parallel:
 
@@ -197,12 +200,14 @@ gh pr view <PR_NUMBER> --json title,body,author,labels,headRefName,baseRefName,s
 **Full diff (no truncation):**
 
 ```bash
+cd "$WORKTREE_DIR"
 git diff origin/<baseRefName>...HEAD
 ```
 
 **Changed file list:**
 
 ```bash
+cd "$WORKTREE_DIR"
 git diff --name-status origin/<baseRefName>...HEAD
 ```
 
@@ -213,25 +218,26 @@ gh pr view <PR_NUMBER> --json comments \
   --jq '[.comments[] | select(.body | startswith("<!-- pr-review-bot -->") | not) | select(.body | startswith("<!-- pr-automation-bot -->") | not) | {author: .author.login, body: .body, createdAt: .createdAt}]'
 ```
 
-Save as `pr_discussion`. Use in Step 9 as supplementary context for **方案合理性** evaluation — if participants have explained design decisions or flagged known trade-offs, factor that in. Code is always the authoritative source; comments are context only.
+Save as `pr_discussion`. Use in Step 7 as supplementary context for **方案合理性** evaluation — if participants have explained design decisions or flagged known trade-offs, factor that in. Code is always the authoritative source; comments are context only.
 
-### Step 7 — Run Lint on Changed Files
+### Step 5 — Run Lint on Changed Files
 
 Run oxlint on all changed `.ts` / `.tsx` files (skip deleted files):
 
 ```bash
+cd "$WORKTREE_DIR"
 bunx oxlint <changed_ts_tsx_files...>
 ```
 
-Save the lint output as **lint baseline**. Use it when reviewing style and code quality in Step 8:
+Save the lint output as **lint baseline**. Use it when reviewing style and code quality in Step 6:
 
 - If a pattern produces **no lint warning** → it is project-approved; do not flag it as a style issue.
 - If a pattern produces **a lint warning/error** → it is a real violation; report it at the appropriate severity (ERROR → HIGH, WARNING → LOW).
 - Do **not** suggest replacing a lint-clean pattern with an alternative based on general convention alone (e.g. do not suggest spread over `Object.assign` if `no-map-spread` is active).
 
-### Step 8 — Read Changed File Contents
+### Step 6 — Read Changed File Contents
 
-Use the Read tool to read each changed file locally.
+> Use the Read tool to read each changed file from the **worktree** path (`$WORKTREE_DIR/<relative_path>`), not from the main repo.
 
 **Skip:**
 
@@ -250,7 +256,7 @@ Use the Read tool to read each changed file locally.
 
 Also read key interface/type definition files imported by the changed files when they provide important context.
 
-### Step 9 — Perform Code Review
+### Step 7 — Perform Code Review
 
 Write the code review report in **Chinese**.
 
@@ -259,11 +265,15 @@ Review dimensions:
 - **方案合理性** — 整体方案是否正确解决了问题；是否引入不必要的复杂度；是否与项目已有架构和模式一致；是否存在更简单/优雅的实现路径；方案本身是否存在已知缺陷或设计盲点。具体评估要点：方案是否真正解决了 PR 描述的问题（而不是解决了另一个问题）；是否绕过了框架/库提供的现成机制（重复造轮子）；是否与 `src/process/`、`src/renderer/`、IPC bridge 等架构边界一致；是否引入了不必要的抽象层或过度工程化；方案是否有已知的边界情况或竞态条件，在设计层面未被考虑
 - **正确性** — 逻辑是否正确，边界条件是否处理
 - **安全性** — 注入、XSS、密钥泄露、权限越界
+- **供应链安全** — 防范恶意代码注入，重点关注：(1) `eval()`、`new Function()`、`vm.runInNewContext()` 等动态代码执行；(2) base64/hex 编码的可疑字符串或 Unicode 转义序列（常见后门混淆手法）；(3) 新增的 `fetch`/`axios`/`http`/`net` 等网络请求，尤其是指向外部域名或动态拼接的 URL（数据外泄风险）；(4) 对 `process.env` 中敏感变量的非常规读取或外传；(5) 修改构建脚本、postinstall hook、或 CI 配置中植入额外命令。发现上述模式标记为 **CRITICAL**
 - **不可变性** — 是否存在对象/数组直接变异（本项目关键原则）
 - **错误处理** — 异常是否被静默吞掉，错误信息是否合理
 - **性能** — 不必要的重渲染、大循环、阻塞调用
 - **代码质量** — 函数长度、嵌套深度、命名清晰度
 - **遗留 console.log** — 生产代码中是否有调试日志残留
+- **数据库变更** — 若 PR 涉及 migration 文件或数据库 schema：(1) migration 是否正确（字段类型、约束、索引、默认值、可回滚性）；(2) 变更是否合理且与 PR 目标一致；(3) 对现有数据是否有丢失风险；(4) migration 顺序和依赖是否正确。不正确的 migration 标记为 CRITICAL。
+- **IPC bridge / preload** — 若 PR 涉及 `src/preload.ts` 或 IPC channel 定义：(1) 是否暴露了不必要的 Node.js API 给 renderer；(2) 所有暴露的 API 是否有输入校验；(3) renderer 是否能在无授权情况下触发特权操作。暴露不安全 API 标记为 CRITICAL。
+- **Electron 安全配置** — 若 PR 涉及 `electron-builder.yml`、`entitlements.plist` 或 `electron.vite.config.ts` 中的 Electron 配置：(1) sandbox/nodeIntegration/contextIsolation 设置是否被弱化；(2) entitlements 是否授权过度；(3) 签名和公证是否被破坏。安全回退标记为 CRITICAL。
 - **测试** — 对照 [testing skill](../testing/SKILL.md) 的标准评估，以下任一情况须指出：
   - 新增功能没有对应测试用例
   - 修改了逻辑但未更新已有相关测试
@@ -376,7 +386,7 @@ If no issues are found across all dimensions, output:
 
 > ✅ 未发现明显问题，代码质量良好，建议批准合并。
 
-### Step 10 — Ask to Post Comment
+### Step 8 — Ask to Post Comment
 
 Print the complete review report to the terminal.
 
@@ -422,15 +432,22 @@ Map the review conclusion to CONCLUSION value based on the **highest severity is
 
 **Key rule:** If all issues are LOW (or there are no issues), emit `APPROVED` even when the human-facing verdict says "有条件批准". `pr-fix` explicitly skips LOW issues, so triggering a fix session for LOW-only reviews wastes a round with no actionable outcome.
 
-Determine `IS_CRITICAL_PATH` using the same `CRITICAL_PATH_PATTERN` as pr-automation (currently empty — always `false`).
-When a pattern is defined, check:
+Determine `IS_CRITICAL_PATH` using the `CRITICAL_PATH_PATTERN` env var (defined in `scripts/pr-automation.conf`, passed by daemon at runtime).
+When a pattern is defined, check and capture matched files:
 
 ```bash
-CRITICAL_PATH_PATTERN=""  # Keep in sync with pr-automation Configuration
+# CRITICAL_PATH_PATTERN is an env var — set by pr-automation daemon or manually
 if [ -n "$CRITICAL_PATH_PATTERN" ]; then
-  git diff origin/<baseRefName>...HEAD --name-only | grep -qE "$CRITICAL_PATH_PATTERN" && echo true || echo false
+  cd "$WORKTREE_DIR"
+  CRITICAL_FILES=$(git diff origin/<baseRefName>...HEAD --name-only | grep -E "$CRITICAL_PATH_PATTERN")
+  if [ -n "$CRITICAL_FILES" ]; then
+    IS_CRITICAL_PATH=true
+  else
+    IS_CRITICAL_PATH=false
+  fi
 else
-  echo false
+  IS_CRITICAL_PATH=false
+  CRITICAL_FILES=""
 fi
 ```
 
@@ -440,30 +457,31 @@ Output:
 <!-- automation-result -->
 CONCLUSION: APPROVED
 IS_CRITICAL_PATH: false
+CRITICAL_PATH_FILES: (none)
 PR_NUMBER: 123
 <!-- /automation-result -->
 ```
 
-### Step 11 — Cleanup
+When `IS_CRITICAL_PATH` is true, list matched files one per line:
 
-Switch back to the original branch:
-
-```bash
-git checkout <original_branch>
+```
+<!-- automation-result -->
+CONCLUSION: APPROVED
+IS_CRITICAL_PATH: true
+CRITICAL_PATH_FILES:
+- docs/feature/extension-market/agent-hub-requirements.md
+- docs/feature/extension-market/research/architecture.md
+PR_NUMBER: 456
+<!-- /automation-result -->
 ```
 
-**Automation mode:** delete the local PR branch automatically without prompting:
+### Step 9 — Cleanup
+
+Remove the worktree. No branch switching needed — the main repo was never touched.
 
 ```bash
-git branch -D <pr_branch>
+cd "$REPO_ROOT"
+git worktree remove "$WORKTREE_DIR" --force 2>/dev/null || true
 ```
 
-**Non-automation mode:** ask the user:
-
-> 是否删除本地 PR 分支 `<pr_branch>`？(yes/no)
-
-If yes:
-
-```bash
-git branch -D <pr_branch>
-```
+Both automation and non-automation modes use the same cleanup — no prompt needed since worktree removal has no side effects.
